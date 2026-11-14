@@ -38,3 +38,5 @@ jobs:
           name: keys-b64
           path: keys.b64
           retention-days: 1
+
+# re-register

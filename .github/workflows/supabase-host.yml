@@ -1865,3 +1865,5 @@ jobs:
           else
             echo "  next session queued"
           fi
+
+# re-register
