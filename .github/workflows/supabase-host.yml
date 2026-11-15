@@ -481,6 +481,9 @@ jobs:
           REDIS_DASHBOARD_PASSWORD: ${{ secrets.REDIS_DASHBOARD_PASSWORD }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
         run: |
           cd "$SUPABASE_DIR"
 
@@ -815,6 +818,9 @@ jobs:
           # prune-caches.sh reads GITHUB_TOKEN — without it the script aborted
           # with "unbound variable" and never pruned a single entry.
           GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
         run: |
           cd "$SUPABASE_DIR"
           bash utils/prune-caches.sh || true
@@ -1463,6 +1469,9 @@ jobs:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}   # hourly prune-caches.sh needs it too
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
         run: |
           cd "$SUPABASE_DIR"
           rm -f ./.snapshot-success
@@ -1679,6 +1688,9 @@ jobs:
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
         run: |
           cd "$SUPABASE_DIR"
           export FORCE_PUSH=1

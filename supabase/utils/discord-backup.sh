@@ -27,6 +27,7 @@ load_cfg() {
     [ -f "$env_file" ] || continue
     [ -n "$DISCORD_BACKUP_WEBHOOK" ] || DISCORD_BACKUP_WEBHOOK="$(grep -E '^DISCORD_BACKUP_WEBHOOK=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
   done
+  export DISCORD_BACKUP_WEBHOOK
 }
 
 cfg_ok() {

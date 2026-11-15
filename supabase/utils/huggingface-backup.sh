@@ -36,6 +36,7 @@ load_cfg() {
     [ -n "${HF_RETENTION_DAYS:-}" ] || HF_RETENTION_DAYS="$(grep -E '^HF_RETENTION_DAYS=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
   done
   HF_RETENTION_DAYS="${HF_RETENTION_DAYS:-7}"
+  export HF_TOKEN HF_REPO HF_RETENTION_DAYS
 }
 
 cfg_ok() {
@@ -45,6 +46,7 @@ cfg_ok() {
 ensure_hf_hub() {
   if ! python3 -c "import huggingface_hub" >/dev/null 2>&1; then
     echo "  📦 installing huggingface_hub..."
+    python3 -m pip install -q --upgrade --break-system-packages huggingface_hub >/dev/null 2>&1 || \
     python3 -m pip install -q --upgrade huggingface_hub >/dev/null 2>&1 || {
       echo "  ERROR: failed to install huggingface_hub" >&2
       return 1
