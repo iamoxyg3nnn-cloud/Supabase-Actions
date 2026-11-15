@@ -350,19 +350,43 @@ pack_archive() {
 pack_archive || exit 1
 
 # ── 6. Off-site mirror to Cloudflare KV (realtime / fast-sync) ────────
-PUSH_INTERVAL="${CF_PUSH_INTERVAL:-60}"
+PUSH_INTERVAL="${CF_PUSH_INTERVAL:-3600}"
 CF_MARKER=./.cf_push_last
+CF_SHA_MARKER=./.cf_push_sha
+CF_QUOTA_FILE=./.cf_quota_exhausted
+
 if [ -s ./supabase-state.tar.gz ]; then
   DO_PUSH=1
-  if [ "${FORCE_PUSH:-0}" != "1" ] && [ -f "$CF_MARKER" ]; then
-    LAST_PUSH=$(cat "$CF_MARKER" 2>/dev/null || echo 0)
+  CURRENT_SHA=$(sha256sum ./supabase-state.tar.gz 2>/dev/null | cut -d' ' -f1)
+  LAST_SHA=$(cat "$CF_SHA_MARKER" 2>/dev/null || echo "")
+
+  # Check if Cloudflare daily 1,000 writes quota was exhausted today
+  if [ -f "$CF_QUOTA_FILE" ]; then
+    RESET_TS=$(cat "$CF_QUOTA_FILE" 2>/dev/null || echo 0)
     NOW=$(date +%s)
-    if [[ "$LAST_PUSH" =~ ^[0-9]+$ ]] \
-       && [ "$LAST_PUSH" -le "$NOW" ] \
-       && [ $(( NOW - LAST_PUSH )) -lt $PUSH_INTERVAL ]; then
+    if [[ "$RESET_TS" =~ ^[0-9]+$ ]] && [ "$NOW" -lt "$RESET_TS" ]; then
       DO_PUSH=0
+      echo "  ℹ️  Cloudflare push skipped: daily write limit (1,000 writes/day) reached for today. Paused until 00:00 UTC. Previous latest backup is safe."
     else
-      rm -f "$CF_MARKER"
+      rm -f "$CF_QUOTA_FILE"
+    fi
+  fi
+
+  if [ "$DO_PUSH" = 1 ] && [ "${FORCE_PUSH:-0}" != "1" ]; then
+    if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$LAST_SHA" ]; then
+      DO_PUSH=0
+      echo "  ℹ️  Cloudflare push skipped (state archive unchanged since last push)"
+    elif [ -f "$CF_MARKER" ]; then
+      LAST_PUSH=$(cat "$CF_MARKER" 2>/dev/null || echo 0)
+      NOW=$(date +%s)
+      if [[ "$LAST_PUSH" =~ ^[0-9]+$ ]] \
+         && [ "$LAST_PUSH" -le "$NOW" ] \
+         && [ $(( NOW - LAST_PUSH )) -lt $PUSH_INTERVAL ]; then
+        DO_PUSH=0
+        echo "  ℹ️  Cloudflare push skipped (last push < ${PUSH_INTERVAL}s ago)"
+      else
+        rm -f "$CF_MARKER"
+      fi
     fi
   fi
   if [ "$DO_PUSH" = 1 ]; then
@@ -396,13 +420,12 @@ if [ -s ./supabase-state.tar.gz ]; then
     if [ "$PUSH_VERIFIED" -eq 1 ]; then
       date +%s > "$CF_MARKER.new"
       mv -f "$CF_MARKER.new" "$CF_MARKER"
+      [ -n "$CURRENT_SHA" ] && echo "$CURRENT_SHA" > "$CF_SHA_MARKER"
     elif grep -q '^CF_API_TOKEN=.' .env 2>/dev/null \
          && grep -q '^CF_ACCOUNT_ID=.' .env 2>/dev/null \
          && grep -q '^CF_KV_NAMESPACE_ID=.' .env 2>/dev/null; then
       echo "  ⚠️  Cloudflare backup failed verification; the next snapshot will retry"
     fi
-  else
-    echo "  ℹ️  Cloudflare push skipped (last push < ${PUSH_INTERVAL}s ago)"
   fi
 fi
 
@@ -431,5 +454,19 @@ fi
 if [ -s ./supabase-state.tar.gz ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
   echo "  💾 pushing real-time snapshot to GitHub Actions Cache..."
   node utils/save-actions-cache.cjs ./supabase-state.tar.gz 2>&1 || true
+fi
+
+# ── 9. Off-site mirror to Hugging Face Private Dataset (50 GB Vault) ───
+if [ -s ./supabase-state.tar.gz ]; then
+  if grep -q '^HF_TOKEN=.' .env 2>/dev/null || [ -n "${HF_TOKEN:-}" ]; then
+    bash utils/huggingface-backup.sh push ./supabase-state.tar.gz || echo "  ⚠️  Hugging Face backup failed; other backups preserved"
+  fi
+fi
+
+# ── 10. Off-site mirror to Discord Webhook (Chunked Cloud Vault) ───────
+if [ -s ./supabase-state.tar.gz ]; then
+  if grep -q '^DISCORD_BACKUP_WEBHOOK=.' .env 2>/dev/null || [ -n "${DISCORD_BACKUP_WEBHOOK:-}" ]; then
+    bash utils/discord-backup.sh push ./supabase-state.tar.gz || echo "  ⚠️  Discord backup failed; other backups preserved"
+  fi
 fi
 

@@ -460,6 +460,20 @@ jobs:
             echo "  Cloudflare backup ready (off-site mirror + disaster-recovery restore)"
           fi
 
+      - name: 🌐 Wire Hugging Face & Discord backup creds
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO: ${{ vars.HF_REPO || secrets.HF_REPO }}
+          DISCORD_BACKUP_WEBHOOK: ${{ secrets.DISCORD_BACKUP_WEBHOOK }}
+        run: |
+          cd "$SUPABASE_DIR"
+          [ -n "$HF_TOKEN" ] && echo "HF_TOKEN=$HF_TOKEN" >> .env
+          [ -n "$HF_REPO" ] && echo "HF_REPO=$HF_REPO" >> .env
+          [ -n "$DISCORD_BACKUP_WEBHOOK" ] && echo "DISCORD_BACKUP_WEBHOOK=$DISCORD_BACKUP_WEBHOOK" >> .env
+          [ -n "$HF_TOKEN" ] && echo "  🤗 Hugging Face backup enabled ($HF_REPO)"
+          [ -n "$DISCORD_BACKUP_WEBHOOK" ] && echo "  💬 Discord backup enabled"
+          true
+
       # Restore all database and runtime state before starting application services.
       - name: Restore full state (databases, Redis, mail, functions, settings)
         env:
@@ -804,6 +818,7 @@ jobs:
         run: |
           cd "$SUPABASE_DIR"
           bash utils/prune-caches.sh || true
+          bash utils/cloudflare-backup.sh prune || true
 
       # Restore databases before starting the application services.
       - name:  Start containers + restore DB
@@ -1573,9 +1588,10 @@ jobs:
               fi
               NEXT_SNAP=$((NOW + 60))
               SLOT=$((SLOT + 1))
-              # Prune old cache entries every 15 snapshots (~15 min, keeps newest 5)
+              # Prune old cache entries & expired KV backups every 15 snapshots (~15 min)
               if [ $(( SLOT % 15 )) -eq 0 ]; then
                 bash utils/prune-caches.sh >/dev/null 2>&1 || true
+                bash utils/cloudflare-backup.sh prune >/dev/null 2>&1 || true
               fi
             fi
 

@@ -20,12 +20,13 @@
 # on-disk archive and chunk temp dirs are removed after each push.
 #
 # Usage:
-#   cloudflare-backup.sh push <file>            # verify, publish + prune oldest
+#   cloudflare-backup.sh push <file>            # verify, publish + prune expired
 #   cloudflare-backup.sh restore <outfile>      # pull latest and reassemble
 #   cloudflare-backup.sh manifest               # print latest backup's unix ts
 #   cloudflare-backup.sh verify                 # confirm 'latest' is restorable (size+sha256)
 #   cloudflare-backup.sh refresh                # renew access token from the .env refresh token
 #   cloudflare-backup.sh list                   # show keys + retention state
+#   cloudflare-backup.sh prune                  # prune backups > 7 days (guarantees >= 1 backup kept)
 #
 # NOTE on OAuth tokens: Cloudflare 'cfor*' refresh tokens are SINGLE-USE and
 # rotate on every mint. The workflow keeps the rotated token in supabase/.env so
@@ -44,8 +45,10 @@ CF_ENV="$BASE_DIR/.env"
 ROOT_ENV="$BASE_DIR/../.env"
 
 CHUNK_BYTES=$((24 * 1024 * 1024))   # 24 MiB (KV hard limit is 25 MiB)
-KEEP_ARCHIVES=3                      # complete generations kept under archive/
-RESTORE_ATTEMPTS=20                      # allow time for KV edge propagation during restore
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"  # prune backups older than 7 days
+MAX_KEEP_ARCHIVES="${MAX_KEEP_ARCHIVES:-2}"          # max complete generations kept (fits 1 GB quota)
+MIN_KEEP_ARCHIVES=1                                  # absolute safety floor: never delete the only backup
+RESTORE_ATTEMPTS=20                                  # allow time for KV edge propagation during restore
 
 CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 CF_KV_NAMESPACE_ID="${CF_KV_NAMESPACE_ID:-}"
@@ -116,6 +119,9 @@ put_with_retry() {
     put_value "$1" "$2"
     return $?
   fi
+  if [ "$status" -eq 3 ]; then
+    return 3
+  fi
   return 1
 }
 
@@ -170,13 +176,56 @@ print(d.get("result_info", {}).get("cursor") or d.get("cursor") or "")
   done
 }
 
+# Bulk delete keys from Cloudflare KV (fast + uses 1 API call per batch)
+bulk_delete_keys() {
+  local doomed_file="$1" code keys_json count
+  [ -s "$doomed_file" ] || return 0
+  count="$(wc -l < "$doomed_file" | tr -d ' ')"
+  [ "$count" -eq 0 ] && return 0
+
+  keys_json="$(python3 -c '
+import sys, json
+keys = [line.strip() for line in open(sys.argv[1]) if line.strip()]
+print(json.dumps(keys))
+' "$doomed_file" 2>/dev/null)" || return 1
+
+  code="$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' -X DELETE \
+    "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/bulk" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "$keys_json" || true)"
+
+  if [ "$code" = "200" ]; then
+    return 0
+  fi
+
+  # Fallback to per-key deletion if bulk delete endpoint fails
+  echo "  ⚠️  bulk delete returned HTTP ${code:-000}; falling back to individual deletes"
+  local k enc_key status=0
+  while IFS= read -r k; do
+    [ -n "$k" ] || continue
+    enc_key="$(urlenc "$k")"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+      "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$enc_key" \
+      -H "Authorization: Bearer $CF_API_TOKEN" || true)"
+    if [ "$code" != "200" ] && [ "$code" != "404" ]; then
+      echo "  ⚠️  delete of $k returned HTTP $code"
+      status=1
+    fi
+  done < "$doomed_file"
+  return $status
+}
+
 prune_archives() {
-  local all keep="" tss="" ts latest_generation="" latest_tmp latest_status
-  if ! all="$(list_keys 'archive%2F')"; then
+  local mode="${1:-normal}"
+  local all latest_generation="" latest_tmp latest_status
+  # List all keys to evaluate archive/ generations, incomplete chunks, and legacy keys
+  if ! all="$(list_keys '')"; then
     echo "  ⚠️  archive pruning skipped because KV listing was incomplete"
     return 1
   fi
   [ -z "$all" ] && return 0
+
   latest_tmp="$(mktemp)"
   get_value "latest/manifest.json" "$latest_tmp"
   latest_status=$?
@@ -185,82 +234,163 @@ prune_archives() {
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(d.get("generation", ""))
-' "$latest_tmp" 2>/dev/null)" || {
-      rm -f "$latest_tmp"
-      echo "  ⚠️  archive pruning skipped because the latest manifest is invalid"
-      return 1
-    }
-  elif [ "$latest_status" -ne 2 ]; then
-    rm -f "$latest_tmp"
-    echo "  ⚠️  archive pruning skipped because the latest manifest could not be read"
-    return 1
+' "$latest_tmp" 2>/dev/null)" || true
   fi
   rm -f "$latest_tmp"
-  tss="$(printf '%s\n' "$all" \
-    | sed -n 's|^archive/\([0-9][0-9]*\)/.*$|\1|p' \
-    | sort -un)"
-  [ -z "$tss" ] && return 0
-  # Retain only complete generations; failed uploads have no manifest and
-  # should not displace a usable backup or accumulate orphaned chunks.
-  local complete
-  complete="$(printf '%s\n' "$all" \
-    | sed -n 's|^archive/\([0-9][0-9]*\)/manifest\.json$|\1|p' \
-    | sort -un)"
-  keep="$(printf '%s\n' "$complete" | tail -n "$KEEP_ARCHIVES")"
-  if [ -n "$latest_generation" ] \
-     && ! printf '%s\n' "$keep" | grep -Fxq "$latest_generation"; then
-    keep="${keep}"$'\n'"$latest_generation"
-  fi
-  local doomed="" k delete_failed=0
-  while IFS= read -r ts; do
-    if ! printf '%s\n' "$keep" | grep -qx "$ts"; then
-      while IFS= read -r k; do
-        doomed="$doomed${doomed:+,}\"$k\""
-      done <<EOF
-$(printf '%s\n' "$all" | grep "^archive/$ts/")
-EOF
+
+  local doomed_tmp plan_summary
+  doomed_tmp="$(mktemp)"
+
+  plan_summary="$(printf '%s\n' "$all" | python3 -c '
+import sys, json, time
+
+mode = "'"$mode"'"
+retention_days = int("'"${BACKUP_RETENTION_DAYS:-7}"'")
+max_keep = int("'"${MAX_KEEP_ARCHIVES:-2}"'")
+if mode == "pre-push":
+    # Edge case protection: ensure space for incoming backup by pruning down to max_keep - 1 (min 1)
+    max_keep = max(1, max_keep - 1)
+
+latest_gen = "'"${latest_generation:-}"'"
+now = int(time.time())
+max_age_secs = retention_days * 86400
+
+all_keys = [line.strip() for line in sys.stdin if line.strip()]
+
+generations = {}
+legacy_keys = []
+for k in all_keys:
+    if k.startswith("archive/"):
+        parts = k.split("/")
+        if len(parts) >= 2:
+            generations.setdefault(parts[1], []).append(k)
+    elif k.startswith("latest/"):
+        if k != "latest/manifest.json":
+            legacy_keys.append(k)
+    else:
+        legacy_keys.append(k)
+
+complete_gens = []
+incomplete_gens = []
+for g, g_keys in generations.items():
+    has_manifest = any(k.endswith("/manifest.json") for k in g_keys)
+    try:
+        ts = int(g[:10])
+    except Exception:
+        ts = 0
+    # Edge case protection: clock skew in future
+    if ts > now + 86400:
+        ts = now
+    if has_manifest:
+        complete_gens.append({"gen": g, "ts": ts, "keys": g_keys})
+    else:
+        incomplete_gens.append({"gen": g, "ts": ts, "keys": g_keys})
+
+# Sort complete generations chronologically ascending (oldest first)
+complete_gens.sort(key=lambda x: x["ts"])
+doomed_keys = list(legacy_keys)
+kept_gens = set()
+
+# Edge case: incomplete generations older than 30 mins are abandoned uploads
+for inc in incomplete_gens:
+    inc_age = max(0, now - inc["ts"]) if inc["ts"] > 0 else 999999
+    if inc_age > 1800:
+        doomed_keys.extend(inc["keys"])
+
+total_complete = len(complete_gens)
+
+if total_complete <= 1:
+    # SAFEGUARD: If only 1 backup exists, NEVER delete it regardless of age or pre-push!
+    if total_complete == 1:
+        g = complete_gens[0]["gen"]
+        kept_gens.add(g)
+        msg = f"Only 1 complete backup exists ({g}) — protected by safety rule! Never deleted."
+    else:
+        msg = "No complete backups found in KV."
+else:
+    # Multiple complete backups exist
+    # 1. Newest complete generation is ALWAYS protected
+    newest = complete_gens[-1]
+    kept_gens.add(newest["gen"])
+    if latest_gen:
+        kept_gens.add(latest_gen)
+
+    # 2. Evaluate older candidates (from newest down to oldest)
+    candidates = [c for c in complete_gens if c["gen"] not in kept_gens]
+    for cand in reversed(candidates):
+        g = cand["gen"]
+        age = max(0, now - cand["ts"])
+        # Prune if expired (> retention_days) OR exceeds max_keep target
+        if age > max_age_secs:
+            doomed_keys.extend(cand["keys"])
+        elif len(kept_gens) >= max_keep:
+            doomed_keys.extend(cand["keys"])
+        else:
+            kept_gens.add(g)
+
+    msg = f"Evaluated {total_complete} complete backups ({mode}): keeping {len(kept_gens)}, pruning {total_complete - len(kept_gens)} (retention: {retention_days}d, max: {max_keep})."
+
+# Ensure all doomed keys for non-kept complete generations are marked
+for cg in complete_gens:
+    if cg["gen"] not in kept_gens:
+        for k in cg["keys"]:
+            if k not in doomed_keys:
+                doomed_keys.append(k)
+
+with open(sys.argv[1], "w") as f:
+    for dk in doomed_keys:
+        f.write(dk + "\n")
+
+print(msg)
+' "$doomed_tmp" 2>/dev/null)"
+
+  echo "  ☁️  $plan_summary"
+
+  local doomed_count
+  doomed_count="$(wc -l < "$doomed_tmp" | tr -d ' ')"
+  if [ "$doomed_count" -gt 0 ]; then
+    echo "  🧹 pruning $doomed_count expired/orphaned key(s) from Cloudflare KV..."
+    if bulk_delete_keys "$doomed_tmp"; then
+      echo "  ✅ pruned $doomed_count key(s) successfully"
+    else
+      echo "  ⚠️  pruning encountered errors for some keys"
     fi
-  done <<EOF
-$tss
-EOF
-  if [ -n "$doomed" ]; then
-    local k code
-    for k in $(printf '%s' "$doomed" | tr ',' '\n'); do
-      k="${k#\"}"; k="${k%\"}"
-      local enc enc_key
-      enc_key=""
-      # encode the key for the URL path
-      local i len=${#k} c
-      for ((i = 0; i < len; i++)); do
-        c="${k:i:1}"
-        case "$c" in
-          [a-zA-Z0-9._-]) enc_key="$enc_key$c" ;;
-          *) enc_key="$enc_key$(printf '%%%02X' "'$c")" ;;
-        esac
-      done
-      code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-        "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$enc_key" \
-        -H "Authorization: Bearer $CF_API_TOKEN")"
-      if [ "$code" != "200" ]; then
-        echo "  ⚠️  delete of $k returned HTTP $code"
-        delete_failed=1
-      fi
-    done
-    if [ "$delete_failed" -eq 1 ]; then
-      return 1
-    fi
-    echo "  🧹 pruned $(printf '%s' "$doomed" | tr ',' '\n' | wc -l | tr -d ' ') old archive key(s) (kept newest $KEEP_ARCHIVES complete generation(s))"
+  else
+    echo "  ✅ storage healthy — no keys require pruning"
   fi
+  rm -f "$doomed_tmp"
 }
 
 put_value() {  # put_value <key> <file>
-  local key="$1" file="$2" code
-  code="$(curl -sS --max-time 120 -o /dev/null -w '%{http_code}' -X PUT \
+  local key="$1" file="$2" code resp_file
+  resp_file="$(mktemp)"
+  code="$(curl -sS --max-time 120 -o "$resp_file" -w '%{http_code}' -X PUT \
     "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$(urlenc "$key")" \
     -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$file" || true)"
-  [ "$code" = "200" ] && return 0
-  [ "$code" = "401" ] && return 2
+  if [ "$code" = "200" ]; then
+    rm -f "$resp_file"
+    return 0
+  fi
+  if [ "$code" = "401" ]; then
+    rm -f "$resp_file"
+    return 2
+  fi
+  if [ "$code" = "429" ]; then
+    local err_msg
+    err_msg="$(grep -o '"message":"[^"]*"' "$resp_file" 2>/dev/null | head -1 | cut -d: -f2- | tr -d '"' || echo "daily usage limit reached")"
+    echo "  ::warning::Cloudflare KV daily write limit reached (HTTP 429: ${err_msg}). Resets at 00:00 UTC." >&2
+    # Mark cooldown until next 00:00 UTC so subsequent ticks do not spam retries
+    python3 -c '
+import time, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+print(int(tomorrow.timestamp()))
+' > "$BASE_DIR/.cf_quota_exhausted" 2>/dev/null || true
+    rm -f "$resp_file"
+    return 3
+  fi
   echo "  ERROR: Cloudflare KV upload of $key returned HTTP ${code:-000}" >&2
+  rm -f "$resp_file"
   return 1
 }
 
@@ -302,6 +432,17 @@ cmd_push() {
   tmp="$(mktemp -d)"
   sha="$(sha256sum "$file" | cut -d' ' -f1)"
 
+  # Edge case pre-flight check: refuse upload if single file exceeds Cloudflare KV free ceiling (950 MiB)
+  local MAX_KV_BYTES=$((950 * 1024 * 1024))
+  if [ "$size" -gt "$MAX_KV_BYTES" ]; then
+    echo "  ::error::State archive ($size bytes) exceeds Cloudflare KV free storage limit (950 MiB). Upload aborted to avoid burning write quota." >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  # Pre-push pruning: prune older backups down to max_keep - 1 so the new upload has guaranteed headroom
+  prune_archives "pre-push" || echo "  ⚠️  pre-push pruning skipped"
+
   if ! split -b "$CHUNK_BYTES" -d -a 8 "$file" "$tmp/chunk."; then
     echo "  ERROR: could not split state archive for Cloudflare KV" >&2
     rm -rf "$tmp"
@@ -310,8 +451,14 @@ cmd_push() {
   parts=0
   for f in "$tmp"/chunk.*; do
     nn="${f##*.}"
-    if ! put_with_retry "archive/$generation/$base.$nn" "$f"; then
-      echo "  ::warning::Cloudflare backup: chunk $nn upload failed — previous latest preserved"
+    put_with_retry "archive/$generation/$base.$nn" "$f"
+    code=$?
+    if [ "$code" -ne 0 ]; then
+      if [ "$code" -eq 3 ]; then
+        echo "  ::warning::Cloudflare KV backup paused: account reached daily write limit (1,000 writes/day). Previous latest backup is safely preserved."
+      else
+        echo "  ::warning::Cloudflare backup: chunk $nn upload failed — previous latest preserved"
+      fi
       rm -rf "$tmp"
       return 1
     fi
@@ -608,6 +755,15 @@ cmd_list() {
 }
 
 # ---------------------------------------------------------------------------
+cmd_prune() {
+  load_cfg
+  if ! cfg_ok; then
+    echo "  ⚠️  Cloudflare prune SKIPPED — CF_API_TOKEN/CF_KV_NAMESPACE_ID not configured"
+    return 0
+  fi
+  prune_archives
+}
+
 case "${1:-}" in
   push)    shift; cmd_push "$@" ;;
   restore) shift; cmd_restore "$@" ;;
@@ -615,5 +771,6 @@ case "${1:-}" in
   verify)  cmd_verify "$@" ;;
   refresh) cmd_refresh "$@" ;;
   list)    cmd_list ;;
-  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | manifest | verify | refresh | list}"; exit 1 ;;
+  prune)   cmd_prune ;;
+  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | manifest | verify | refresh | list | prune}"; exit 1 ;;
 esac
