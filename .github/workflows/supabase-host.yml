@@ -57,20 +57,6 @@ on:
         description: 'Source of the trigger (self-chain handoff)'
         required: false
         default: ''
-  schedule:
-    # Hourly at :23 — deliberately off the top of the hour, because GitHub
-    # drops/delays `0 * * * *` crons under load and this repo's previous
-    # `0 */6 * * *` schedule had never fired. With cancel-in-progress: false a
-    # scheduled run queued behind a live session simply waits, so an hourly tick
-    # can never kill a session and always leaves a restart waiting in the wings
-    # if the end-of-run self-chain ever fails.
-    - cron: '23 * * * *'
-
-  # NOTE: 'push' trigger removed on purpose  a push mid-session would queue a
-  # duplicate run (concurrency no longer cancels live sessions). Manual runs now
-  # QUEUE behind the active session and start after it ends. Use workflow_dispatch
-  # or the self-chain handoff to restart instead.
-
 concurrency:
   group: supabase-host
   # NO cancel-in-progress: a new run (schedule or self-chain) QUEUES behind the
@@ -1836,7 +1822,7 @@ jobs:
             SIZE=$(du -h ${{ env.BACKUP_FILE }} | cut -f1)
             echo "|  Database backed up ($SIZE)                                |"
           fi
-          echo "|  Next run: self-chain dispatch (queued immediately)         |"
+          echo "|  Next run: managed by Cloudflare Worker (node-watchman)      |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  https://$DOMAIN                                              |"
             echo "|  Redis API: https://$DOMAIN/functions/v1/redis-http          |"
@@ -1852,46 +1838,3 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/actions/caches" 2>/dev/null | \
             python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"{d.get(\"total_size_bytes\",0)/1024/1024/1024:.2f} GB across {d.get(\"total_count\",0)} cache entries (limit 10 GB)")' 2>/dev/null || echo "unknown")
           echo "    GitHub cache usage: $USAGE"
-
-      #  Chain the next session
-      # GitHub's `schedule` trigger has never fired for this repo (0 schedule
-      # runs since it was created) — so the reliable 24/7 handoff is the run
-      # re-dispatching itself as its final act. That is permitted with the
-      # built-in token: `workflow_dispatch` is the documented exception to the
-      # "GITHUB_TOKEN-triggered events do not create runs" rule, and this job
-      # already declares `actions: write`. Guarded so that a cancelled run, an
-      # early (pre-session) failure, or an operator `.session-stop` never starts
-      # a new session — only one that actually ran (success) or died mid-session
-      # (health-check `failure`) chains forward. The hourly schedule remains as
-      # a backstop for cases this cannot cover (hard 6h kill, or a cancel).
-      - name:  Chain the next session
-        if: ${{ always() && !cancelled() && (steps.keepalive.outcome == 'success' || steps.keepalive.outcome == 'failure') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          # Operator asked the stack to stay down — honour the marker.
-          if curl -sf --max-time 10 -o /dev/null \
-               -H "Authorization: Bearer $GH_TOKEN" \
-               -H "Accept: application/vnd.github.raw" \
-               "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.session-stop?ref=master"; then
-            echo "  .session-stop marker present — not chaining a new session."
-            exit 0
-          fi
-          echo "  Chaining next session (keepalive outcome: ${{ steps.keepalive.outcome }})"
-          BODY='{"ref":"master","inputs":{"triggered_by":"self-chain"}}'
-          CODE=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/supabase-host.yml/dispatches" \
-            -d "$BODY")
-          echo "  dispatch HTTP ${CODE}"
-          if [ "$CODE" != "204" ]; then
-            echo "::warning::self-chain dispatch failed (HTTP ${CODE}); the hourly schedule will have to restart"
-            cat /tmp/dispatch.out 2>/dev/null || true
-          else
-            echo "  next session queued"
-          fi
-
-# re-register
